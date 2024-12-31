@@ -1,0 +1,184 @@
+---
+- name: Deploy EC2 instance and set up Minikube
+  hosts: localhost
+  gather_facts: no
+  vars:
+    instance_name: "minikube-ec2"
+    region: "us-east-1"
+    key_name: "minikube-kp"
+    instance_type: "t3.small"
+    ami_id: "ami-0e2c8caa4b6378d8c"  # Ubuntu Server 24.04 LTS
+    security_group: "minikube-sg"
+  tasks:
+    - name: Create a security group
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group }}"
+        description: "Allow SSH and HTTP access"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 22  # SSH
+              - 80  # HTTP
+              - 8080 # Web app
+            cidr_ip: 0.0.0.0/0
+        state: present
+        aws_access_key: ""
+        aws_secret_key: ""
+      register: sg_result
+
+    - name: Launch EC2 instance
+      amazon.aws.ec2_instance:
+        name: "{{ instance_name }}"
+        region: "{{ region }}"
+        key_name: "{{ key_name }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        security_groups: "{{ security_group }}"
+        wait: yes
+        aws_access_key: ""
+        aws_secret_key: ""
+      register: ec2_result
+
+    - name: Add EC2 instance to inventory
+      add_host:
+        name: "{{ ec2_result.instances[0].public_ip_address }}"
+        groups: ec2_instances
+        ansible_user: ubuntu
+        ansible_ssh_private_key_file: ./minikube-kp.pem
+
+    - name: Get public IP of the EC2 instance
+      set_fact:
+        ec2_ip: "{{ ec2_result.instances[0].public_ip_address }}"
+    
+    - name: Wait for SSH to become available
+      wait_for:
+        host: "{{ ec2_ip }}"
+        port: 22
+        state: started
+        delay: 10
+        timeout: 300
+
+    # Update package lists and install Docker
+    - name: Update package lists and install Docker
+      ansible.builtin.shell: |
+        sudo apt-get update && sudo apt-get install -y docker.io
+      delegate_to: "{{ ec2_ip }}"
+    
+   # Create Docker group and add user to it
+    - name: Ensure Docker group exists
+      ansible.builtin.shell: |
+        sudo groupadd docker || echo "Docker group already exists"
+      become: true
+      delegate_to: "{{ ec2_ip }}"
+
+    - name: Add user to docker group
+      ansible.builtin.shell: |
+        sudo usermod -aG docker ubuntu
+      become: true
+      delegate_to: "{{ ec2_ip }}"
+    
+    # Restart Docker service to apply changes
+    - name: Restart Docker service to apply group membership changes
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      become: true
+      delegate_to: "{{ ec2_ip }}"
+
+    # Install kubectl
+    - name: Install kubectl
+      ansible.builtin.shell: |
+        curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
+        sudo mv kubectl /usr/local/bin/
+        sudo chmod +x /usr/local/bin/kubectl
+      delegate_to: "{{ ec2_ip }}"
+
+    # Install minikube
+    - name: Install Minikube
+      ansible.builtin.shell: |
+        curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        sudo mv minikube-linux-amd64 /usr/local/bin/minikube
+        sudo chmod +x /usr/local/bin/minikube
+      delegate_to: "{{ ec2_ip }}"
+
+    # Start Minikube
+    - name: Start Minikube
+      ansible.builtin.shell: |
+        sudo -u ubuntu minikube start --driver=docker  # Run Minikube as 'ubuntu'
+      become: false  # Avoid using 'root' privileges
+      delegate_to: "{{ ec2_ip }}"
+
+    # Get Minikube status
+    - name: Get Minikube status
+      ansible.builtin.shell: |
+        sudo -u ubuntu minikube status
+      register: minikube_status
+      become: false  # Avoid using 'root' privileges
+      delegate_to: "{{ ec2_ip }}"
+
+    - name: Print Minikube status
+      ansible.builtin.debug:
+        msg: "{{ minikube_status.stdout }}"
+
+    # Enable Ingress addon in Minikube
+    - name: Enable Minikube Ingress addon
+      ansible.builtin.shell: |
+        sudo -u ubuntu minikube addons enable ingress
+      become: false  # Avoid using 'root' privileges
+      delegate_to: "{{ ec2_ip }}"
+
+    # Get Pods in the ingress-nginx namespace
+    - name: Get Pods in ingress-nginx namespace
+      ansible.builtin.shell: |
+        sudo -u ubuntu kubectl get pods -n ingress-nginx
+      delegate_to: "{{ ec2_ip }}"
+      register: ingress_pods
+
+    - name: Print Pods in ingress-nginx namespace
+      ansible.builtin.debug:
+        msg: "{{ ingress_pods.stdout }}"
+
+    - name: Create wordsmith_app directory on remote EC2 instance
+      ansible.builtin.file:
+        path: /home/ubuntu/wordsmith_app
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+      delegate_to: "{{ ec2_ip }}"
+
+    # - name: Copy wordsmith_app files to EC2 instance excluding inventory
+    - name: Copy 'db' directory to EC2 instance
+      ansible.builtin.copy:
+        src: /home/ubuntu/wordsmith_app/db/
+        dest: /home/ubuntu/wordsmith_app/db/
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+      delegate_to: "{{ ec2_ip }}"
+
+    - name: Copy 'k8s-manifests' directory to EC2 instance
+      ansible.builtin.copy:
+        src: /home/ubuntu/wordsmith_app/k8s-manifests/
+        dest: /home/ubuntu/wordsmith_app/k8s-manifests/
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+      delegate_to: "{{ ec2_ip }}"
+
+    - name: Copy 'kustomization.yaml' file to EC2 instance
+      ansible.builtin.copy:
+        src: /home/ubuntu/wordsmith_app/kustomization.yaml
+        dest: /home/ubuntu/wordsmith_app/kustomization.yaml
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+      delegate_to: "{{ ec2_ip }}"
+
+
+    - name: Apply resources using Kustomize
+      ansible.builtin.shell: |
+        sudo -u ubuntu kubectl apply -k /home/ubuntu/wordsmith_app/
+      become: true
+      delegate_to: "{{ ec2_ip }}"
